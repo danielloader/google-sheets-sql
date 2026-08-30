@@ -102,12 +102,14 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &conn{
+	cn := &conn{
 		cfg:     c.cfg,
 		http:    cl,
 		limiter: c.limiter,
 		schemas: newSchemaCache(),
-	}, nil
+	}
+	cn.pad = sharedPad(c.cfg.SpreadsheetID, cn.scratchSheet())
+	return cn, nil
 }
 
 type conn struct {
@@ -117,7 +119,7 @@ type conn struct {
 	schemas *schemaCache
 
 	tabs    tabIndex
-	pad     scratchPad
+	pad     *scratchPad
 	svcOnce sync.Once
 	svc     *sheets.Service
 	svcErr  error

@@ -189,6 +189,34 @@ unchanged for more than 11 seconds after a committed Sheets write, and
 Google-native files never populate `headRevisionId`. Trusting either would
 report "nothing moved" while rows had moved. The re-read is unconditional.
 
+## Concurrency model
+
+Two different models apply, because the two engines have different constraints.
+
+**Formula evaluation is single-writer**, like SQLite's writer lock. A formula
+must occupy a real cell while Google computes it, so joins, `HAVING`, `UNION`
+and `CASE` queries are serialised on the scratch sheet: one at a time per
+`(spreadsheet, scratch sheet)`, process-wide. `database/sql` opens a connection
+per concurrent query, so this lock deliberately sits outside the connection —
+sharing a scratch cell would let two queries each read the other's result, with
+no error raised.
+
+Two consequences:
+
+- Concurrent join queries queue rather than run in parallel. Given the
+  60 requests/minute quota, request rate is usually the binding constraint
+  anyway.
+- The lock is **process-local**. Two processes querying one spreadsheet will
+  collide on the same scratch cell. Give each a distinct `scratch=` tab.
+
+**Single-tab reads are unsynchronised.** They go straight to gviz, hold no
+state in the document, and may run fully in parallel.
+
+**Row writes are optimistic, not serialised.** `INSERT` appends. `UPDATE` and
+`DELETE` re-verify their target rows immediately before writing and abort with
+a `*ConflictError` if anything moved (see below), rather than taking a lock.
+Concurrent writers therefore make progress; a loser is told, not blocked.
+
 ## Writes
 
 | Statement | Implementation |

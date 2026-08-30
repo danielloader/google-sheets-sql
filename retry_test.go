@@ -121,3 +121,30 @@ func TestLimiterStartsBelowFull(t *testing.T) {
 		t.Errorf("bucket starts at %v; a full bucket bursts into the next quota window", l.tokens)
 	}
 }
+
+// The scratch pad must be shared per spreadsheet, not per connection:
+// database/sql opens a connection per concurrent query, and two formula
+// evaluations sharing one cell would each read the other's result.
+func TestSharedPadIsPerSpreadsheet(t *testing.T) {
+	a := sharedPad("sheet-1", "_scratch")
+	b := sharedPad("sheet-1", "_scratch")
+	if a != b {
+		t.Error("same spreadsheet and scratch sheet must share one pad")
+	}
+	if c := sharedPad("sheet-2", "_scratch"); c == a {
+		t.Error("different spreadsheets must not share a pad")
+	}
+	if d := sharedPad("sheet-1", "_other"); d == a {
+		t.Error("different scratch sheets must not share a pad")
+	}
+}
+
+func TestSharedLimiterIsPerSpreadsheet(t *testing.T) {
+	a := sharedLimiter("lim-1", 60)
+	if b := sharedLimiter("lim-1", 60); a != b {
+		t.Error("same spreadsheet must share one limiter")
+	}
+	if c := sharedLimiter("lim-2", 60); c == a {
+		t.Error("different spreadsheets must not share a limiter")
+	}
+}

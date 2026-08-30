@@ -48,10 +48,33 @@ func asFormulaError(v any, formula string) error {
 
 // scratchPad serialises use of the scratch cell. Formula evaluation is
 // inherently stateful: the formula must occupy a real cell while Google
-// computes it, so two queries cannot share one pad concurrently.
+// computes it, so two statements cannot share one pad concurrently.
+//
+// Pads are shared per (spreadsheet, scratch sheet) rather than per connection.
+// database/sql opens a connection per concurrent query, so a per-connection
+// lock would let two joins write the same cell and each read the other's
+// result -- silently, with no error. Formula evaluation is therefore
+// single-writer within a process, as SQLite is for its database file.
 type scratchPad struct {
 	mu      sync.Mutex
 	ensured bool
+}
+
+var (
+	padMu  sync.Mutex
+	padReg = map[string]*scratchPad{}
+)
+
+func sharedPad(spreadsheetID, sheet string) *scratchPad {
+	key := spreadsheetID + "\x00" + sheet
+	padMu.Lock()
+	defer padMu.Unlock()
+	if p, ok := padReg[key]; ok {
+		return p
+	}
+	p := &scratchPad{}
+	padReg[key] = p
+	return p
 }
 
 func (c *conn) scratchSheet() string {
