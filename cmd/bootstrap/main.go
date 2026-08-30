@@ -45,6 +45,16 @@ var fixtures = map[string][][]any{
 		{"apac", "Asia", "UTC+8"},
 		{"latam", "Americas", "UTC-3"},
 	},
+	// targets joins to sales on two columns at once, exercising composite keys.
+	"targets": {
+		{"region", "quarter", "target"},
+		{"emea", "Q1", 100000},
+		{"emea", "Q2", 110000},
+		{"amer", "Q1", 200000},
+		{"amer", "Q2", 190000},
+		{"apac", "Q1", 80000},
+		{"apac", "Q2", 85000},
+	},
 	"sales": {
 		{"region", "quarter", "amount"},
 		{"emea", "Q1", 120500.5},

@@ -158,6 +158,9 @@ func (c *conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 	if err != nil {
 		return nil, fmt.Errorf("sheetsql: parse: %w", err)
 	}
+	if u, ok := stmt.(*sqlparser.Union); ok {
+		return c.queryUnion(ctx, u, args)
+	}
 	sel, ok := stmt.(*sqlparser.Select)
 	if !ok {
 		return nil, fmt.Errorf("sheetsql: %T is not a query; use Exec", stmt)

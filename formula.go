@@ -36,10 +36,16 @@ type srcTable struct {
 	offset int // 0-based column offset within the composed array
 	width  int
 
-	kind     joinKind
-	leftKey  int    // 1-based composed position of the left-hand join key
-	rightKey column // join key within this table
+	kind joinKind
+	// A join may key on several columns. Positions are 1-based within the
+	// composed array; rightKeys are the matching columns of this table.
+	leftKeys  []int
+	rightKeys []column
 }
+
+// keySep joins the parts of a composite key. U+241F is the symbol for "unit
+// separator" and does not occur in spreadsheet data.
+const keySep = "\u241F"
 
 // composition is the column namespace of a compiled join.
 type composition struct {
@@ -83,6 +89,20 @@ func (c *composition) column(qualifier, name string) (string, string, error) {
 		return "", "", fmt.Errorf("sheetsql: no column %q in %s", name, c.describe())
 	}
 	return colRef(found.offset + colIndex(col.Letter)), col.Type, nil
+}
+
+// position returns the 1-based column position of a reference within the
+// composed array, for INDEX().
+func (c *composition) position(qualifier, name string) (int, error) {
+	ident, _, err := c.column(qualifier, name)
+	if err != nil {
+		return 0, err
+	}
+	n, err := strconv.Atoi(strings.TrimPrefix(ident, "Col"))
+	if err != nil {
+		return 0, fmt.Errorf("sheetsql: bad column reference %q", ident)
+	}
+	return n, nil
 }
 
 func (c *composition) star(qualifier string) ([]projected, error) {
@@ -217,8 +237,9 @@ func (c *conn) buildComposition(ctx context.Context, sel *sqlparser.Select) (*co
 	return comp, joins, nil
 }
 
-// resolveJoinKeys interprets each ON clause as a single equality between a
-// column of an already-composed table and a column of the table being joined.
+// resolveJoinKeys interprets each ON clause as one or more equalities between
+// columns of an already-composed table and columns of the table being joined.
+// Several equalities become a composite key, matched as one concatenated value.
 func (comp *composition) resolveJoinKeys(joins []*sqlparser.JoinTableExpr) error {
 	for i, j := range joins {
 		right := comp.tables[i+1]
@@ -237,37 +258,59 @@ func (comp *composition) resolveJoinKeys(joins []*sqlparser.JoinTableExpr) error
 		if j.Condition.On == nil {
 			return unsupported("a join without an ON clause")
 		}
-		cmp, ok := j.Condition.On.(*sqlparser.ComparisonExpr)
-		if !ok || cmp.Operator != "=" {
-			return unsupported("join conditions other than a single equality")
+		var eqs []*sqlparser.ComparisonExpr
+		if err := collectEqualities(j.Condition.On, &eqs); err != nil {
+			return err
 		}
-		lc, ok1 := cmp.Left.(*sqlparser.ColName)
-		rc, ok2 := cmp.Right.(*sqlparser.ColName)
-		if !ok1 || !ok2 {
-			return unsupported("join conditions that are not column = column")
-		}
+		for _, cmp := range eqs {
+			lc, ok1 := cmp.Left.(*sqlparser.ColName)
+			rc, ok2 := cmp.Right.(*sqlparser.ColName)
+			if !ok1 || !ok2 {
+				return unsupported("join conditions that are not column = column")
+			}
 
-		// Whichever side names the table being joined is the lookup key.
-		lTab, lCol, lerr := comp.locate(lc)
-		rTab, rCol, rerr := comp.locate(rc)
-		if lerr != nil {
-			return lerr
-		}
-		if rerr != nil {
-			return rerr
-		}
-		switch {
-		case rTab == right && lTab != right:
-			right.rightKey = rCol
-			right.leftKey = lTab.offset + colIndex(lCol.Letter) + 1
-		case lTab == right && rTab != right:
-			right.rightKey = lCol
-			right.leftKey = rTab.offset + colIndex(rCol.Letter) + 1
-		default:
-			return fmt.Errorf("sheetsql: the ON clause for %q must compare one of its columns to an earlier table", right.alias)
+			// Whichever side names the table being joined is the lookup key.
+			lTab, lCol, lerr := comp.locate(lc)
+			rTab, rCol, rerr := comp.locate(rc)
+			if lerr != nil {
+				return lerr
+			}
+			if rerr != nil {
+				return rerr
+			}
+			switch {
+			case rTab == right && lTab != right:
+				right.rightKeys = append(right.rightKeys, rCol)
+				right.leftKeys = append(right.leftKeys, lTab.offset+colIndex(lCol.Letter)+1)
+			case lTab == right && rTab != right:
+				right.rightKeys = append(right.rightKeys, lCol)
+				right.leftKeys = append(right.leftKeys, rTab.offset+colIndex(rCol.Letter)+1)
+			default:
+				return fmt.Errorf("sheetsql: the ON clause for %q must compare its columns to an earlier table", right.alias)
+			}
 		}
 	}
 	return nil
+}
+
+// collectEqualities flattens an ON clause of ANDed equalities.
+func collectEqualities(e sqlparser.Expr, out *[]*sqlparser.ComparisonExpr) error {
+	switch n := e.(type) {
+	case *sqlparser.AndExpr:
+		if err := collectEqualities(n.Left, out); err != nil {
+			return err
+		}
+		return collectEqualities(n.Right, out)
+	case *sqlparser.ParenExpr:
+		return collectEqualities(n.Expr, out)
+	case *sqlparser.ComparisonExpr:
+		if n.Operator != "=" {
+			return unsupported("join conditions other than equality")
+		}
+		*out = append(*out, n)
+		return nil
+	}
+	return unsupported("this join condition")
 }
 
 func (comp *composition) locate(cn *sqlparser.ColName) (*srcTable, column, error) {
@@ -310,13 +353,32 @@ func (t *srcTable) baseSource() string {
 // lookupSource renders {key, all-columns} so VLOOKUP can search on the join key
 // and return any column of the table.
 func (t *srcTable) lookupSource() string {
-	return fmt.Sprintf("{%s,%s}",
-		a1Column(t.sheet, 1, colIndex(t.rightKey.Letter)),
-		a1Range(t.sheet, 1, 0, t.width-1))
+	return fmt.Sprintf("{%s,%s}", t.keyColumn(), a1Range(t.sheet, 1, 0, t.width-1))
 }
 
+// keyColumn is the lookup table's key: a single column, or the parts of a
+// composite key concatenated so VLOOKUP can match on one value.
 func (t *srcTable) keyColumn() string {
-	return a1Column(t.sheet, 1, colIndex(t.rightKey.Letter))
+	if len(t.rightKeys) == 1 {
+		return a1Column(t.sheet, 1, colIndex(t.rightKeys[0].Letter))
+	}
+	parts := make([]string, 0, len(t.rightKeys))
+	for _, k := range t.rightKeys {
+		parts = append(parts, a1Column(t.sheet, 1, colIndex(k.Letter)))
+	}
+	return "ARRAYFORMULA(" + strings.Join(parts, `&"`+keySep+`"&`) + ")"
+}
+
+// leftKeyExpr is the probe side of the join, taken from the composed array.
+func (t *srcTable) leftKeyExpr(src string) string {
+	if len(t.leftKeys) == 1 {
+		return fmt.Sprintf("INDEX(%s,0,%d)", src, t.leftKeys[0])
+	}
+	parts := make([]string, 0, len(t.leftKeys))
+	for _, p := range t.leftKeys {
+		parts = append(parts, fmt.Sprintf("INDEX(%s,0,%d)", src, p))
+	}
+	return "ARRAYFORMULA(" + strings.Join(parts, `&"`+keySep+`"&`) + ")"
 }
 
 // vlookupIndices selects every column of the joined table; index 1 is the key
@@ -330,19 +392,41 @@ func (t *srcTable) vlookupIndices() string {
 }
 
 // compileFormula turns a parsed SELECT into one spreadsheet formula.
+// compileFormula assembles a complete formula for one SELECT.
 func compileFormula(comp *composition, sel *sqlparser.Select, args []driver.NamedValue) (string, []resultCol, bool, error) {
+	binds, body, cols, bare, err := compileSelectParts(comp, sel, args, "_")
+	if err != nil {
+		return "", nil, false, err
+	}
+	return assembleLet(binds, body), cols, bare, nil
+}
+
+// assembleLet wraps bindings and a result expression in the LET that Google
+// evaluates. The values API omits blank cells, so a row that is entirely NULL
+// -- an unmatched LEFT JOIN, say -- would come back indistinguishable from no
+// row at all. Substituting a sentinel keeps such rows addressable.
+func assembleLet(binds []string, body string) string {
+	binds = append(binds, "_r,"+body)
+	tail := fmt.Sprintf("ARRAYFORMULA(IF(_r=\"\",%s,_r))", quoteFormulaString(formulaNull))
+	return "=LET(" + strings.Join(binds, ",") + "," + tail + ")"
+}
+
+// compileSelectParts renders one SELECT into LET bindings plus the expression
+// that produces its rows. Bindings are prefixed so several selects can share
+// one LET scope, as UNION requires.
+func compileSelectParts(comp *composition, sel *sqlparser.Select, args []driver.NamedValue, p string) ([]string, string, []resultCol, bool, error) {
 	tr := &translator{src: comp, args: args, multi: true}
 
 	var binds []string
-	prev := "_s0"
+	prev := p + "s0"
 	binds = append(binds, prev+","+comp.tables[0].baseSource())
 
 	for i, t := range comp.tables[1:] {
-		lk := fmt.Sprintf("_l%d", i+1)
-		cur := fmt.Sprintf("_s%d", i+1)
+		lk := fmt.Sprintf("%sl%d", p, i+1)
+		cur := fmt.Sprintf("%ss%d", p, i+1)
 		binds = append(binds, lk+","+t.lookupSource())
-		binds = append(binds, fmt.Sprintf("%s,{%s,ARRAYFORMULA(IFNA(VLOOKUP(INDEX(%s,0,%d),%s,%s,FALSE),\"\"))}",
-			cur, prev, prev, t.leftKey, lk, t.vlookupIndices()))
+		binds = append(binds, fmt.Sprintf("%s,{%s,ARRAYFORMULA(IFNA(VLOOKUP(%s,%s,%s,FALSE),\"\"))}",
+			cur, prev, t.leftKeyExpr(prev), lk, t.vlookupIndices()))
 		prev = cur
 	}
 
@@ -351,25 +435,39 @@ func compileFormula(comp *composition, sel *sqlparser.Select, args []driver.Name
 	var guards []string
 	for _, t := range comp.tables[1:] {
 		if t.kind == joinInner {
-			guards = append(guards, fmt.Sprintf("ISNUMBER(MATCH(INDEX(%s,0,%d),%s,0))",
-				prev, t.leftKey, t.keyColumn()))
+			guards = append(guards, fmt.Sprintf("ISNUMBER(MATCH(%s,%s,0))",
+				t.leftKeyExpr(prev), t.keyColumn()))
 		}
 	}
 	if len(guards) > 0 {
-		binds = append(binds, "_f,FILTER("+prev+","+strings.Join(guards, ",")+")")
-		prev = "_f"
+		binds = append(binds, p+"f,FILTER("+prev+","+strings.Join(guards, ",")+")")
+		prev = p + "f"
 	}
+
+	// Anything QUERY cannot evaluate -- CASE, or a function outside the small
+	// gviz set -- is computed first as extra columns of the source array.
+	extra, pre, err := precomputeColumns(comp, sel, prev, args)
+	if err != nil {
+		return nil, "", nil, false, err
+	}
+	if len(extra) > 0 {
+		exprs := make([]string, 0, len(extra)+1)
+		exprs = append(exprs, prev)
+		for i, x := range extra {
+			name := fmt.Sprintf("%sx%d", p, i+1)
+			binds = append(binds, name+",ARRAYFORMULA("+x+")")
+			exprs = append(exprs, name)
+		}
+		binds = append(binds, p+"e,{"+strings.Join(exprs, ",")+"}")
+		prev = p + "e"
+	}
+	tr.precomputed = pre
 
 	q, cols, bare, err := tr.compileQuery(sel, prev)
 	if err != nil {
-		return "", nil, false, err
+		return nil, "", nil, false, err
 	}
-	// The values API omits blank cells, so a row that is entirely NULL -- an
-	// unmatched LEFT JOIN, say -- would come back indistinguishable from no
-	// row at all. Substituting a sentinel keeps such rows addressable.
-	binds = append(binds, "_r,"+q)
-	body := fmt.Sprintf("ARRAYFORMULA(IF(_r=\"\",%s,_r))", quoteFormulaString(formulaNull))
-	return "=LET(" + strings.Join(binds, ",") + "," + body + ")", cols, bare, nil
+	return binds, q, cols, bare, nil
 }
 
 // compileQuery renders the QUERY() call(s) over the composed array. A HAVING
@@ -506,6 +604,21 @@ func convertGridCell(v any, typ string) (driver.Value, error) {
 	if s, ok := v.(string); ok && (s == "" || s == formulaNull) {
 		return nil, nil
 	}
+	if typ == "" {
+		// A computed column has no declared type; take it from the value.
+		switch x := v.(type) {
+		case bool:
+			return x, nil
+		case float64:
+			if x == math.Trunc(x) && math.Abs(x) < 1<<53 {
+				return int64(x), nil
+			}
+			return x, nil
+		case string:
+			return x, nil
+		}
+		return fmt.Sprint(v), nil
+	}
 	switch typ {
 	case "number":
 		f, ok := toFloat(v)
@@ -536,6 +649,121 @@ func convertGridCell(v any, typ string) (driver.Value, error) {
 	return fmt.Sprint(v), nil
 }
 
+// precomputeColumns finds every expression the query language cannot evaluate,
+// renders it as an array formula, and reports where each will sit in the
+// extended array.
+func precomputeColumns(comp *composition, sel *sqlparser.Select, src string, args []driver.NamedValue) ([]string, map[string]precomputedCol, error) {
+	width := 0
+	for _, t := range comp.tables {
+		width += t.width
+	}
+
+	r := &sheetRenderer{comp: comp, src: src, args: args}
+	pre := map[string]precomputedCol{}
+	var out []string
+
+	var walkErr error
+	visit := func(e sqlparser.Expr) {
+		if walkErr != nil || !isSheetOnly(e) {
+			return
+		}
+		key := sqlparser.String(e)
+		if _, seen := pre[key]; seen {
+			return
+		}
+		rendered, err := r.render(e)
+		if err != nil {
+			walkErr = err
+			return
+		}
+		pre[key] = precomputedCol{Ident: colRef(width + len(out)), Type: sheetExprType(e)}
+		out = append(out, rendered)
+	}
+
+	forEachExpr(sel, visit)
+	if walkErr != nil {
+		return nil, nil, walkErr
+	}
+	return out, pre, nil
+}
+
+type precomputedCol struct {
+	Ident string
+	Type  string
+}
+
+// isSheetOnly reports whether an expression must be computed by the formula
+// engine because the query language has no equivalent.
+func isSheetOnly(e sqlparser.Expr) bool {
+	switch n := e.(type) {
+	case *sqlparser.CaseExpr, *sqlparser.SubstrExpr:
+		return true
+	case *sqlparser.FuncExpr:
+		name := strings.ToLower(n.Name.String())
+		if _, ok := gvizAggregates[name]; ok {
+			return false
+		}
+		if _, ok := gvizScalars[name]; ok {
+			return false
+		}
+		return true
+	}
+	return false
+}
+
+// sheetExprType guesses the type of a computed column so values convert back
+// sensibly. CASE may yield either, so it is left unknown.
+func sheetExprType(e sqlparser.Expr) string {
+	if _, ok := e.(*sqlparser.SubstrExpr); ok {
+		return "string"
+	}
+	if fe, ok := e.(*sqlparser.FuncExpr); ok {
+		switch strings.ToLower(fe.Name.String()) {
+		case "abs", "sqrt", "power", "pow", "floor", "ceil", "ceiling", "round",
+			"mod", "exp", "ln", "log10", "sign", "length", "char_length",
+			"character_length", "year", "month", "day", "dayofmonth", "hour",
+			"minute", "second":
+			return "number"
+		case "concat", "upper", "ucase", "lower", "lcase", "trim", "ltrim",
+			"rtrim", "substr", "substring", "mid", "left", "right", "replace":
+			return "string"
+		}
+	}
+	return ""
+}
+
+// forEachExpr visits the expressions of a SELECT that may need precomputing.
+func forEachExpr(sel *sqlparser.Select, fn func(sqlparser.Expr)) {
+	walk := func(e sqlparser.Expr) {
+		if e == nil {
+			return
+		}
+		sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+			if ex, ok := node.(sqlparser.Expr); ok {
+				fn(ex)
+			}
+			return true, nil
+		}, e)
+	}
+	for _, se := range sel.SelectExprs {
+		if ae, ok := se.(*sqlparser.AliasedExpr); ok {
+			walk(ae.Expr)
+		}
+	}
+	if sel.Where != nil {
+		walk(sel.Where.Expr)
+	}
+	for _, g := range sel.GroupBy {
+		walk(g)
+	}
+	if sel.Having != nil {
+		walk(sel.Having.Expr)
+	}
+	for _, o := range sel.OrderBy {
+		walk(o.Expr)
+	}
+}
+
 // needsFormula reports whether a statement exceeds what one gviz query can do.
 func needsFormula(sel *sqlparser.Select) bool {
 	if sel.Having != nil {
@@ -544,8 +772,16 @@ func needsFormula(sel *sqlparser.Select) bool {
 	if len(sel.From) != 1 {
 		return true
 	}
-	_, isJoin := sel.From[0].(*sqlparser.JoinTableExpr)
-	return isJoin
+	if _, isJoin := sel.From[0].(*sqlparser.JoinTableExpr); isJoin {
+		return true
+	}
+	found := false
+	forEachExpr(sel, func(e sqlparser.Expr) {
+		if isSheetOnly(e) {
+			found = true
+		}
+	})
+	return found
 }
 
 // queryFormula compiles and runs a statement through the formula engine.

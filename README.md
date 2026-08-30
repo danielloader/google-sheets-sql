@@ -34,10 +34,10 @@ GROUP BY Major ORDER BY count(*) DESC LIMIT 4
   ->  select E, count(A) where B = 'Female' group by E order by count(A) desc limit 4
 ```
 
-**2. The spreadsheet formula engine.** gviz cannot join or express `HAVING`, so
-anything needing them is compiled into a single formula, written to a hidden
-scratch tab, evaluated by Google, and read back. The scratch cell is always
-cleared afterwards.
+**2. The spreadsheet formula engine.** gviz cannot join, express `HAVING`,
+`UNION` or `CASE`, and knows only a handful of functions. Anything needing more
+is compiled into a single formula, written to a hidden scratch tab, evaluated by
+Google, and read back. The scratch cell is always cleared afterwards.
 
 ```
 SELECT e.name, d.label FROM employees e JOIN depts d ON e.dept = d.dept
@@ -49,6 +49,22 @@ SELECT e.name, d.label FROM employees e JOIN depts d ON e.dept = d.dept
            _r,QUERY(_f,"select Col2, Col9 label Col2 '', Col9 ''",0),
            ARRAYFORMULA(IF(_r="","␀",_r)))
 ```
+
+Expressions the query language cannot evaluate — `CASE`, or a function outside
+the gviz set — are computed *first* as extra columns of the source array and
+then referenced by position, so the two engines cooperate within one statement:
+
+```
+SELECT upper(name), length(name) FROM employees
+
+  ->  =LET(_s0,FILTER(employees!A2:G,LEN(employees!A2:A)>0),
+           _x1,ARRAYFORMULA(LEN(INDEX(_s0,0,2))),
+           _e,{_s0,_x1},
+           _r,QUERY(_e,"select upper(Col2), Col8 ...",0), ...)
+```
+
+`upper()` stays inside `QUERY` because gviz has it; `length()` becomes a
+computed column because it does not.
 
 Set `SHEETSQL_DEBUG=1` to print the translated query or formula per statement.
 
@@ -67,22 +83,35 @@ Set `SHEETSQL_DEBUG=1` to print the translated query or formula per statement.
 | arithmetic `+ - * /` | **Google** | |
 | `?` placeholders | **Google** | typed against the target column |
 | date/string functions | **Google** | see below |
-| **`INNER JOIN`, `LEFT JOIN`** | **Google** | formula engine; single equality per join |
+| **`INNER JOIN`, `LEFT JOIN`** | **Google** | formula engine; equality conditions, single or composite |
 | **`HAVING`** | **Google** | second `QUERY` wrapping the grouped result |
+| **`UNION`, `UNION ALL`** | **Google** | branches stacked with `{a; b}`; `UNION` wraps in `UNIQUE` |
+| **`CASE WHEN`** (simple and searched) | **Google** | computed column via `IFS` |
+| **extended scalar functions** | **Google** | computed columns, see below |
 | `INSERT` | Google (write) | one `values.append` |
 | `UPDATE`, `DELETE` row matching | **client** | see *Writes* below |
 
-Scalar functions pushed down: `YEAR`, `MONTH`, `DAY`/`DAYOFMONTH`, `HOUR`,
-`MINUTE`, `SECOND`, `QUARTER`, `DAYOFWEEK`, `UPPER`/`UCASE`, `LOWER`/`LCASE`,
-`DATE`, `NOW`, `DATEDIFF`. `MONTH()` is corrected to SQL's 1-based numbering;
-gviz counts months from zero.
+**Evaluated inside `QUERY` (no extra column):** `YEAR`, `MONTH`,
+`DAY`/`DAYOFMONTH`, `HOUR`, `MINUTE`, `SECOND`, `QUARTER`, `DAYOFWEEK`,
+`UPPER`/`UCASE`, `LOWER`/`LCASE`, `DATE`, `NOW`, `DATEDIFF`. `MONTH()` is
+corrected to SQL's 1-based numbering; gviz counts months from zero.
+
+**Computed as an extra column:** `ABS`, `SQRT`, `POWER`/`POW`, `FLOOR`,
+`CEIL`/`CEILING`, `ROUND`, `MOD`, `EXP`, `LN`, `LOG10`, `SIGN`, `LENGTH`/
+`CHAR_LENGTH`, `CONCAT`, `SUBSTR`/`SUBSTRING`, `LEFT`, `RIGHT`, `REPLACE`,
+`TRIM`, `COALESCE`/`IFNULL`, `NULLIF`, `IF`, `CURDATE`.
+
+> **Keep a computed column's types consistent.** `QUERY` infers one type per
+> column and nulls values that do not fit, so `coalesce(salary, 'unset')`
+> returns `NULL` rather than the string — the column is mostly numbers.
+> `coalesce(salary, 0)` behaves as expected.
 
 ### Not supported
 
 `RIGHT JOIN`, `FULL JOIN`, `CROSS JOIN`, `NATURAL JOIN`, `USING`, join
-conditions other than a single `=`, subqueries, `UNION`, `CASE`, window
-functions, and scalar functions outside the list above. Each is rejected with an
-explicit error rather than silently ignored.
+conditions other than equality, subqueries, window functions, mixing `UNION`
+with `UNION ALL` in one statement, and scalar functions outside the lists above.
+Each is rejected with an explicit error rather than silently ignored.
 
 Transactions are refused rather than faked. A spreadsheet offers no isolation,
 and a `Tx` that silently provided none would be worse than none at all.
@@ -227,12 +256,12 @@ Tools:
 
 ## Status
 
-Prototype, exercised end to end against a live spreadsheet: 57 tests covering
+Prototype, exercised end to end against a live spreadsheet: 77 tests covering
 typed reads, `NULL` handling, date filtering, server-side aggregation, scalar
-pushdown, two- and three-table joins, `LEFT JOIN` semantics, `HAVING`,
-row-identity retargeting under concurrent edits, conflict detection, and an
-insert/update/delete round trip, plus offline coverage of the retry and
-rate-limiting behaviour.
+pushdown, `CASE`, `UNION` and `UNION ALL`, two- and three-table joins,
+composite join keys, `LEFT JOIN` semantics, `HAVING`, row-identity retargeting
+under concurrent edits, conflict detection, and an insert/update/delete round
+trip, plus offline coverage of the retry and rate-limiting behaviour.
 
 ## Licence
 

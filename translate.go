@@ -56,6 +56,9 @@ type translator struct {
 	// remap rewrites rendered identifiers, used when a HAVING clause has to
 	// address the columns of an inner query by position.
 	remap map[string]string
+	// precomputed holds expressions evaluated as extra source columns before
+	// the query runs, keyed by their SQL text.
+	precomputed map[string]precomputedCol
 }
 
 func (s *schema) column(qualifier, name string) (string, string, error) {
@@ -468,6 +471,16 @@ func (t *translator) comparison(n *sqlparser.ComparisonExpr) (string, error) {
 // expr renders a scalar expression and reports the gviz type it yields,
 // applying any identifier remapping the caller installed.
 func (t *translator) expr(e sqlparser.Expr) (string, string, error) {
+	if t.precomputed != nil {
+		if p, ok := t.precomputed[sqlparser.String(e)]; ok {
+			if t.remap != nil {
+				if m, ok := t.remap[p.Ident]; ok {
+					return m, p.Type, nil
+				}
+			}
+			return p.Ident, p.Type, nil
+		}
+	}
 	s, ty, err := t.exprRaw(e)
 	if err != nil {
 		return "", "", err
