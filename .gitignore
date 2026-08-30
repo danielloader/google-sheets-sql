@@ -1,0 +1,17 @@
+# Service account keys and other credentials
+*-key.json
+credentials.json
+service-account*.json
+
+# Built binaries
+/sheetsql
+/bootstrap
+/scaletest
+/dropsheets
+
+# Editor / OS noise
+.DS_Store
+
+# Compiled binaries produced by `go build` in the repo root
+/probe
+/sq

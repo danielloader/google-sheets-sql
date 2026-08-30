@@ -1,0 +1,121 @@
+package sheetsql
+
+import (
+	"database/sql/driver"
+	"io"
+	"testing"
+	"time"
+)
+
+func TestConvertCell(t *testing.T) {
+	cases := []struct {
+		v    any
+		typ  string
+		want any
+	}{
+		{nil, "string", nil},
+		{"hi", "string", "hi"},
+		{float64(42), "number", int64(42)},
+		{float64(42.5), "number", 42.5},
+		{true, "boolean", true},
+	}
+	for _, c := range cases {
+		got, err := convertCell(c.v, c.typ)
+		if err != nil {
+			t.Errorf("convertCell(%v,%s): %v", c.v, c.typ, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("convertCell(%v,%s) = %#v, want %#v", c.v, c.typ, got, c.want)
+		}
+	}
+}
+
+func TestConvertDateCell(t *testing.T) {
+	got, err := convertCell("Date(2019,2,1)", "date")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := time.Date(2019, 3, 1, 0, 0, 0, 0, time.UTC)
+	if !got.(time.Time).Equal(want) {
+		t.Errorf("got %v want %v (gviz months are 0-based)", got, want)
+	}
+
+	got, err = convertCell("Date(2019,2,1,10,30,15)", "datetime")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = time.Date(2019, 3, 1, 10, 30, 15, 0, time.UTC)
+	if !got.(time.Time).Equal(want) {
+		t.Errorf("got %v want %v", got, want)
+	}
+}
+
+func TestUnwrapJSONP(t *testing.T) {
+	in := []byte("/*O_o*/\ngoogle.visualization.Query.setResponse({\"status\":\"ok\"});")
+	out, err := unwrapJSONP(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(out) != `{"status":"ok"}` {
+		t.Errorf("got %s", out)
+	}
+	if _, err := unwrapJSONP([]byte("<html>nope</html>")); err == nil {
+		t.Error("expected error for HTML response")
+	}
+}
+
+func TestParseDSN(t *testing.T) {
+	cfg, err := ParseDSN("sheets://abc123?credentials=/k.json&sheet=employees&header=2&rate=30")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SpreadsheetID != "abc123" || cfg.Sheet != "employees" ||
+		cfg.HeaderRow != 2 || cfg.RatePerMin != 30 || cfg.CredentialsFile != "/k.json" {
+		t.Errorf("bad parse: %+v", cfg)
+	}
+
+	cfg, err = ParseDSN("https://docs.google.com/spreadsheets/d/XYZ/edit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SpreadsheetID != "XYZ" {
+		t.Errorf("browser URL: got %q", cfg.SpreadsheetID)
+	}
+	if _, err := ParseDSN("sheets://abc?bogus=1"); err == nil {
+		t.Error("expected error for unknown parameter")
+	}
+}
+
+// gviz returns no rows for a bare aggregate that matches nothing; SQL requires
+// one row, with 0 for count and NULL for the others.
+func TestBareAggregateSynthesisesRow(t *testing.T) {
+	tbl := &gvizTable{Cols: []gvizCol{
+		{ID: "count-A", Label: "count id", Type: "number"},
+		{ID: "sum-D", Label: "sum salary", Type: "number"},
+	}}
+	cols := []resultCol{{Name: "n", Agg: "count"}, {Name: "total", Agg: "sum"}}
+
+	r := newRows(tbl, cols, true)
+	dest := make([]driver.Value, 2)
+	if err := r.Next(dest); err != nil {
+		t.Fatalf("expected one synthesised row, got %v", err)
+	}
+	if dest[0] != int64(0) {
+		t.Errorf("count = %#v, want int64(0)", dest[0])
+	}
+	if dest[1] != nil {
+		t.Errorf("sum = %#v, want nil", dest[1])
+	}
+	if err := r.Next(dest); err != io.EOF {
+		t.Errorf("want EOF after the single row, got %v", err)
+	}
+}
+
+func TestGroupedAggregateNotSynthesised(t *testing.T) {
+	tbl := &gvizTable{Cols: []gvizCol{{ID: "A", Type: "string"}}}
+	r := newRows(tbl, []resultCol{{Name: "dept"}}, false)
+	if err := r.Next(make([]driver.Value, 1)); err != io.EOF {
+		t.Errorf("GROUP BY with no matches must stay empty, got %v", err)
+	}
+}
