@@ -100,8 +100,89 @@ func TestLiveReadOnlyRejectsFormulaQueries(t *testing.T) {
 			t.Errorf("%s: expected a read-only error", q)
 			continue
 		}
-		if !strings.Contains(err.Error(), "read-only") {
-			t.Errorf("%s: got %v, want an error mentioning read-only", q, err)
+		// The message should name the mode that keeps these queries working.
+		if !strings.Contains(err.Error(), "readonly=data") {
+			t.Errorf("%s: got %v, want the error to point at readonly=data", q, err)
 		}
+	}
+}
+
+// noDataWritesDB keeps a write-capable credential but refuses data writes.
+func noDataWritesDB(t *testing.T) *sql.DB {
+	t.Helper()
+	dsn := os.Getenv("SHEETSQL_DSN")
+	if dsn == "" {
+		t.Skip("set SHEETSQL_DSN to run live tests")
+	}
+	sep := "?"
+	if strings.Contains(dsn, "?") {
+		sep = "&"
+	}
+	db, err := sql.Open("sheets", dsn+sep+"readonly=data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
+}
+
+// The point of readonly=data: joins keep working, because they write only to
+// the scratch sheet and never to a data tab.
+func TestLiveNoDataWritesKeepsJoins(t *testing.T) {
+	db := noDataWritesDB(t)
+
+	var label string
+	if err := db.QueryRow(`SELECT d.label FROM employees e
+		JOIN depts d ON e.dept = d.dept WHERE e.name = ?`, "Grace Hopper").
+		Scan(&label); err != nil {
+		t.Fatalf("join under readonly=data: %v", err)
+	}
+	if label != "Engineering" {
+		t.Errorf("label = %q, want Engineering", label)
+	}
+
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM employees
+		GROUP BY dept HAVING count(*) > 3`).Scan(&n); err != nil {
+		t.Fatalf("HAVING under readonly=data: %v", err)
+	}
+	if n != 4 {
+		t.Errorf("count = %d, want 4", n)
+	}
+}
+
+func TestLiveNoDataWritesRefusesWrites(t *testing.T) {
+	db := noDataWritesDB(t)
+	for _, q := range []string{
+		"INSERT INTO employees (id, name) VALUES (9998, 'nope')",
+		"UPDATE employees SET salary = 1 WHERE id = 1",
+		"DELETE FROM employees WHERE id = 9998",
+	} {
+		if _, err := db.Exec(q); err == nil {
+			t.Errorf("%s: expected a read-only error", q)
+		} else if !strings.Contains(err.Error(), "read-only") {
+			t.Errorf("%s: got %v", q, err)
+		}
+	}
+
+	// The refusal must be real, not just unattempted: the row must not exist.
+	var n int
+	if err := db.QueryRow("SELECT count(*) FROM employees WHERE id = 9998").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("a refused INSERT still wrote %d row(s)", n)
+	}
+}
+
+// readonly=1 remains the stricter mode and still refuses joins.
+func TestLiveStrictReadOnlyStillRefusesJoins(t *testing.T) {
+	db := readOnlyDB(t)
+	_, err := db.Query(`SELECT e.name FROM employees e JOIN depts d ON e.dept = d.dept`)
+	if err == nil {
+		t.Fatal("expected readonly=1 to refuse a join")
+	}
+	if !strings.Contains(err.Error(), "readonly=data") {
+		t.Errorf("error should point at readonly=data as the alternative: %v", err)
 	}
 }

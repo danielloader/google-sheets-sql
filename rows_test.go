@@ -151,3 +151,59 @@ func TestConfigScopes(t *testing.T) {
 		t.Errorf("scopes = %v, want spreadsheets.readonly + drive.readonly", got)
 	}
 }
+
+func TestParseAccessMode(t *testing.T) {
+	cases := []struct {
+		dsn  string
+		want AccessMode
+	}{
+		{"sheets://a", AccessReadWrite},
+		{"sheets://a?readonly=0", AccessReadWrite},
+		{"sheets://a?readonly=false", AccessReadWrite},
+		{"sheets://a?readonly=1", AccessStrictReadOnly},
+		{"sheets://a?readonly=true", AccessStrictReadOnly},
+		{"sheets://a?readonly=strict", AccessStrictReadOnly},
+		{"sheets://a?readonly=data", AccessNoDataWrites},
+		{"sheets://a?readonly=nowrites", AccessNoDataWrites},
+	}
+	for _, c := range cases {
+		cfg, err := ParseDSN(c.dsn)
+		if err != nil {
+			t.Errorf("%s: %v", c.dsn, err)
+			continue
+		}
+		if cfg.Access != c.want {
+			t.Errorf("%s: access = %v, want %v", c.dsn, cfg.Access, c.want)
+		}
+	}
+	if _, err := ParseDSN("sheets://a?readonly=maybe"); err == nil {
+		t.Error("expected an error for an unknown readonly value")
+	}
+}
+
+// readonly=data keeps a write-capable credential so joins still work, while
+// refusing statements that would change a data tab.
+func TestAccessModePermissions(t *testing.T) {
+	cases := []struct {
+		mode                AccessMode
+		dataWrites, scratch bool
+		strictScopes        bool
+	}{
+		{AccessReadWrite, true, true, false},
+		{AccessNoDataWrites, false, true, false},
+		{AccessStrictReadOnly, false, false, true},
+	}
+	for _, c := range cases {
+		cfg := &Config{Access: c.mode}
+		if got := cfg.allowsDataWrites(); got != c.dataWrites {
+			t.Errorf("%v: allowsDataWrites = %v, want %v", c.mode, got, c.dataWrites)
+		}
+		if got := cfg.allowsScratchWrites(); got != c.scratch {
+			t.Errorf("%v: allowsScratchWrites = %v, want %v", c.mode, got, c.scratch)
+		}
+		strict := len(cfg.scopes()) == 2
+		if strict != c.strictScopes {
+			t.Errorf("%v: read-only scopes = %v, want %v", c.mode, strict, c.strictScopes)
+		}
+	}
+}

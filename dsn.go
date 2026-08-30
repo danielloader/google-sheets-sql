@@ -22,10 +22,48 @@ type Config struct {
 	HeaderRow       int           // rows to treat as headers; gviz "headers" param
 	Timeout         time.Duration // per-request
 	RatePerMin      int           // client-side request budget
-	ReadOnly        bool
+	Access          AccessMode
 	Scratch         string // sheet used to evaluate compiled formulas
 	MaxRows         int    // ceiling on rows read back from a compiled formula
 }
+
+// AccessMode says what a connection is permitted to change.
+type AccessMode int
+
+const (
+	// AccessReadWrite is the default: data writes and joins both allowed.
+	AccessReadWrite AccessMode = iota
+
+	// AccessNoDataWrites refuses INSERT, UPDATE and DELETE but keeps a
+	// read-write credential, so joins still work. Joins write only to the
+	// scratch sheet, never to a data tab. Enforced by the driver alone: the
+	// token could write if something bypassed it.
+	AccessNoDataWrites
+
+	// AccessStrictReadOnly requests read-only OAuth scopes, so Google refuses
+	// any write whatever the driver does. Joins are unavailable, because they
+	// need to write a formula to the scratch sheet.
+	AccessStrictReadOnly
+)
+
+func parseAccessMode(v string) (AccessMode, error) {
+	switch strings.ToLower(v) {
+	case "0", "false", "off", "":
+		return AccessReadWrite, nil
+	case "1", "true", "strict":
+		return AccessStrictReadOnly, nil
+	case "data", "nowrites", "no-writes":
+		return AccessNoDataWrites, nil
+	}
+	return 0, fmt.Errorf("sheetsql: readonly must be one of 1/true/strict, data, or 0/false; got %q", v)
+}
+
+// allowsDataWrites reports whether INSERT, UPDATE and DELETE are permitted.
+func (c *Config) allowsDataWrites() bool { return c.Access == AccessReadWrite }
+
+// allowsScratchWrites reports whether a formula may be evaluated, which writes
+// to the scratch sheet but never to a data tab.
+func (c *Config) allowsScratchWrites() bool { return c.Access != AccessStrictReadOnly }
 
 func ParseDSN(dsn string) (*Config, error) {
 	cfg := &Config{HeaderRow: 1, Timeout: 180 * time.Second, RatePerMin: 60, MaxRows: 50000}
@@ -89,7 +127,11 @@ func ParseDSN(dsn string) (*Config, error) {
 			}
 			cfg.MaxRows = n
 		case "readonly", "read_only":
-			cfg.ReadOnly = v[0] == "1" || strings.EqualFold(v[0], "true")
+			m, err := parseAccessMode(v[0])
+			if err != nil {
+				return nil, err
+			}
+			cfg.Access = m
 		default:
 			return nil, fmt.Errorf("sheetsql: unknown DSN parameter %q", k)
 		}

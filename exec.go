@@ -21,7 +21,7 @@ func (r result) LastInsertId() (int64, error) {
 func (r result) RowsAffected() (int64, error) { return r.affected, nil }
 
 func (c *conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
-	if c.cfg.ReadOnly {
+	if !c.cfg.allowsDataWrites() {
 		return nil, errReadOnly
 	}
 	stmt, err := sqlparser.Parse(query)

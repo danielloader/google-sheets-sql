@@ -44,7 +44,7 @@ const (
 
 // scopes reports the OAuth scopes a configuration needs.
 func (cfg *Config) scopes() []string {
-	if cfg.ReadOnly {
+	if cfg.Access == AccessStrictReadOnly {
 		return []string{readOnlyScope, readOnlyDriveScope}
 	}
 	return []string{scope}
@@ -272,9 +272,9 @@ func valuesToNamed(args []driver.Value) []driver.NamedValue {
 	return out
 }
 
-// errReadOnly is returned for any statement that would modify the spreadsheet
-// on a connection opened with readonly=1.
-var errReadOnly = errors.New("sheetsql: connection is read-only (remove readonly=1 from the DSN to allow writes)")
+// errReadOnly is returned for any statement that would modify a data tab on a
+// connection opened with readonly=1 or readonly=data.
+var errReadOnly = errors.New("sheetsql: connection is read-only (remove readonly from the DSN to allow writes)")
 
 func normaliseSheet(name string) string {
 	// gviz and the values API disagree about quoting; keep the bare name and

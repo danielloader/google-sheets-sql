@@ -247,18 +247,52 @@ works.
 | `timeout` | `180s` | per request |
 | `rate` | `60` | requests/minute budget |
 | `max_rows` | `50000` | ceiling on rows read back from a formula |
-| `readonly` | `false` | request read-only scopes; see below |
+| `readonly` | `0` | `1`/`strict`, `data`, or `0`; see below |
 
 ## Read-only connections
+
+Two things are separable here, and `readonly` chooses between them:
+
+* **Scope** — whether the credential can write at all, enforced by Google.
+* **Policy** — whether the driver permits statements that change your data.
+
+Joins, `HAVING`, `UNION` and `CASE` are evaluated by writing a formula to the
+scratch sheet. That is a write, but never to a data tab — which is why the two
+concerns are worth separating.
+
+| DSN | Credential | `INSERT`/`UPDATE`/`DELETE` | Joins, `HAVING`, `UNION`, `CASE` |
+| --- | --- | --- | --- |
+| *(default)* | read-write | allowed | yes |
+| `readonly=data` | read-write | **refused** | **yes** |
+| `readonly=1` | **read-only scopes** | **refused by Google** | no |
+
+### `readonly=data` — query-only, joins kept
+
+```
+sheets://<id>?credentials=/path/key.json&readonly=data
+```
+
+Refuses anything that would change a data tab, while keeping a write-capable
+credential so the scratch sheet still works. This is the mode to use for
+reporting and dashboards: the full dialect, no risk of a stray `UPDATE`.
+
+The guarantee is **driver-enforced only**. The token could write if something
+bypassed the driver, so this is a safety rail, not a security boundary.
+
+### `readonly=1` — enforced by Google
 
 ```
 sheets://<id>?credentials=/path/key.json&readonly=1
 ```
 
-This is enforced by the credential, not just by the driver: a read-only DSN
-requests read-only OAuth scopes, so Google itself rejects a write with
-*"Request had insufficient authentication scopes"* even if something in the
-driver tried one.
+Requests read-only OAuth scopes, so Google itself rejects a write with
+*"Request had insufficient authentication scopes"* whatever the driver does.
+Use it when the guarantee has to hold against a bug in this library.
+
+The cost is joins: with no way to write the scratch sheet, they fail with an
+error pointing at `readonly=data`. Everything single-tab still works, with the
+full pushdown surface — `WHERE`, `GROUP BY`, aggregates, `ORDER BY`,
+`LIMIT`/`OFFSET`, `DISTINCT`, `IN`/`BETWEEN`, and the gviz scalar functions.
 
 Both read-only scopes are requested, and both are needed:
 
@@ -274,19 +308,11 @@ Sheets API and rejects `spreadsheets.readonly`, so a Drive-level read scope is
 required alongside it. Note that `drive.readonly` is broad — for a service
 account it is narrowed in practice by which files are shared with it.
 
-**Available read-only:** every single-tab query, with the full pushdown surface
-— `WHERE`, `GROUP BY`, aggregates, `ORDER BY`, `LIMIT`/`OFFSET`, `DISTINCT`,
-`IN`/`BETWEEN`, and the gviz scalar functions.
-
-**Not available read-only:** joins, `HAVING`, `UNION` and `CASE`. All four are
-evaluated by writing a formula to the scratch sheet, which needs write access.
-They fail with an explicit error saying so rather than degrading silently.
-
 ## Access
 
 The spreadsheet must be shared with the service account in the key file —
 Editor for writes and for joins (the scratch tab is a write), Viewer for
-gviz-only reads.
+gviz-only reads with `readonly=1`.
 
 Service accounts have no Drive storage quota and **cannot create spreadsheets**.
 Create the sheet as a human and share it.
@@ -317,7 +343,7 @@ Tools:
 
 ## Status
 
-Prototype, exercised end to end against a live spreadsheet: 85 tests covering
+Prototype, exercised end to end against a live spreadsheet: 90 tests covering
 typed reads, `NULL` handling, date filtering, server-side aggregation, scalar
 pushdown, `CASE`, `UNION` and `UNION ALL`, two- and three-table joins,
 composite join keys, `LEFT JOIN` semantics, `HAVING`, row-identity retargeting
