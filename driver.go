@@ -30,7 +30,25 @@ var debug = os.Getenv("SHEETSQL_DEBUG") != ""
 
 var stderr = os.Stderr
 
-const scope = "https://www.googleapis.com/auth/spreadsheets"
+const (
+	scope = "https://www.googleapis.com/auth/spreadsheets"
+	// readOnlyScopes are requested for a read-only DSN so the credential itself
+	// cannot write, rather than relying on the driver to refuse.
+	//
+	// Both are needed. spreadsheets.readonly covers the Sheets API, but the
+	// Visualization endpoint is served from docs.google.com and rejects it with
+	// 401; it accepts a Drive-level scope instead.
+	readOnlyScope      = "https://www.googleapis.com/auth/spreadsheets.readonly"
+	readOnlyDriveScope = "https://www.googleapis.com/auth/drive.readonly"
+)
+
+// scopes reports the OAuth scopes a configuration needs.
+func (cfg *Config) scopes() []string {
+	if cfg.ReadOnly {
+		return []string{readOnlyScope, readOnlyDriveScope}
+	}
+	return []string{scope}
+}
 
 type Driver struct{}
 
@@ -80,13 +98,13 @@ func (c *connector) httpClient(ctx context.Context) (*http.Client, error) {
 		if rerr != nil {
 			return nil, fmt.Errorf("sheetsql: read credentials: %w", rerr)
 		}
-		jwt, jerr := google.JWTConfigFromJSON(b, scope)
+		jwt, jerr := google.JWTConfigFromJSON(b, c.cfg.scopes()...)
 		if jerr != nil {
 			return nil, fmt.Errorf("sheetsql: parse credentials: %w", jerr)
 		}
 		cl = jwt.Client(ctx)
 	} else {
-		cl, err = google.DefaultClient(ctx, scope)
+		cl, err = google.DefaultClient(ctx, c.cfg.scopes()...)
 		if err != nil {
 			return nil, fmt.Errorf("sheetsql: default credentials: %w", err)
 		}
@@ -254,7 +272,9 @@ func valuesToNamed(args []driver.Value) []driver.NamedValue {
 	return out
 }
 
-var errReadOnly = errors.New("sheetsql: connection is read-only")
+// errReadOnly is returned for any statement that would modify the spreadsheet
+// on a connection opened with readonly=1.
+var errReadOnly = errors.New("sheetsql: connection is read-only (remove readonly=1 from the DSN to allow writes)")
 
 func normaliseSheet(name string) string {
 	// gviz and the values API disagree about quoting; keep the bare name and

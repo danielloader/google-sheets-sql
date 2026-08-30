@@ -3,6 +3,7 @@ package sheetsql
 import (
 	"database/sql/driver"
 	"io"
+	"strings"
 	"testing"
 	"time"
 )
@@ -117,5 +118,36 @@ func TestGroupedAggregateNotSynthesised(t *testing.T) {
 	r := newRows(tbl, []resultCol{{Name: "dept"}}, false)
 	if err := r.Next(make([]driver.Value, 1)); err != io.EOF {
 		t.Errorf("GROUP BY with no matches must stay empty, got %v", err)
+	}
+}
+
+// A read-only DSN must request read-only scopes: refusing writes in the driver
+// alone would still hand out a credential that can write.
+func TestConfigScopes(t *testing.T) {
+	rw, err := ParseDSN("sheets://abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := rw.scopes(); len(got) != 1 || got[0] != scope {
+		t.Errorf("read-write scopes = %v", got)
+	}
+
+	ro, err := ParseDSN("sheets://abc?readonly=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := ro.scopes()
+	if len(got) != 2 {
+		t.Fatalf("read-only scopes = %v, want two", got)
+	}
+	for _, s := range got {
+		if !strings.Contains(s, "readonly") {
+			t.Errorf("scope %q is not read-only", s)
+		}
+	}
+	// The Visualization endpoint rejects spreadsheets.readonly with 401 and
+	// needs a Drive-level scope, so both must be present.
+	if got[0] != readOnlyScope || got[1] != readOnlyDriveScope {
+		t.Errorf("scopes = %v, want spreadsheets.readonly + drive.readonly", got)
 	}
 }

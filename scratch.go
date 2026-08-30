@@ -134,7 +134,8 @@ func (c *conn) ensureScratch(ctx context.Context) error {
 // spilled into, and clears it. The returned grid is the formula's result.
 func (c *conn) evalFormula(ctx context.Context, formula string, ncols int) ([][]any, error) {
 	if c.cfg.ReadOnly {
-		return nil, fmt.Errorf("sheetsql: this query must be compiled to a formula, which needs write access to a scratch sheet, but the connection is read-only")
+		return nil, fmt.Errorf("sheetsql: joins, HAVING, UNION and CASE are evaluated by writing a formula to the %q sheet, which a read-only connection cannot do; single-table queries still work",
+			c.scratchSheet())
 	}
 	if err := c.ensureScratch(ctx); err != nil {
 		return nil, err

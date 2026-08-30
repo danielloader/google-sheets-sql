@@ -247,7 +247,40 @@ works.
 | `timeout` | `180s` | per request |
 | `rate` | `60` | requests/minute budget |
 | `max_rows` | `50000` | ceiling on rows read back from a formula |
-| `readonly` | `false` | reject writes, and with them the join engine |
+| `readonly` | `false` | request read-only scopes; see below |
+
+## Read-only connections
+
+```
+sheets://<id>?credentials=/path/key.json&readonly=1
+```
+
+This is enforced by the credential, not just by the driver: a read-only DSN
+requests read-only OAuth scopes, so Google itself rejects a write with
+*"Request had insufficient authentication scopes"* even if something in the
+driver tried one.
+
+Both read-only scopes are requested, and both are needed:
+
+| Scope | gviz | Sheets API |
+| --- | --- | --- |
+| `spreadsheets` (read-write) | 200 | 200 |
+| `spreadsheets.readonly` | **401** | 200 |
+| `drive.readonly` | 200 | 200 |
+| `spreadsheets.readonly` + `drive.readonly` | 200 | 200 |
+
+The Visualization endpoint is served from `docs.google.com` rather than the
+Sheets API and rejects `spreadsheets.readonly`, so a Drive-level read scope is
+required alongside it. Note that `drive.readonly` is broad — for a service
+account it is narrowed in practice by which files are shared with it.
+
+**Available read-only:** every single-tab query, with the full pushdown surface
+— `WHERE`, `GROUP BY`, aggregates, `ORDER BY`, `LIMIT`/`OFFSET`, `DISTINCT`,
+`IN`/`BETWEEN`, and the gviz scalar functions.
+
+**Not available read-only:** joins, `HAVING`, `UNION` and `CASE`. All four are
+evaluated by writing a formula to the scratch sheet, which needs write access.
+They fail with an explicit error saying so rather than degrading silently.
 
 ## Access
 
@@ -284,12 +317,13 @@ Tools:
 
 ## Status
 
-Prototype, exercised end to end against a live spreadsheet: 77 tests covering
+Prototype, exercised end to end against a live spreadsheet: 85 tests covering
 typed reads, `NULL` handling, date filtering, server-side aggregation, scalar
 pushdown, `CASE`, `UNION` and `UNION ALL`, two- and three-table joins,
 composite join keys, `LEFT JOIN` semantics, `HAVING`, row-identity retargeting
 under concurrent edits, conflict detection, and an insert/update/delete round
-trip, plus offline coverage of the retry and rate-limiting behaviour.
+trip, read-only enforcement, concurrent formula evaluation, plus offline
+coverage of the retry and rate-limiting behaviour.
 
 ## Licence
 
